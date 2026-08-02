@@ -75,11 +75,15 @@ public class VkLodRenderer {
         return VoxyConfig.CONFIG.sectionRenderDistance * (SECTION_WIDTH << MAX_LOD_LEVEL);
     }
 
-    private record SectionDraw(int firstQuad, int quadCount, int originX, int originY, int originZ, float scale) {}
+    private record SectionDraw(int firstQuad, int quadCount, int opaqueCount,
+                               int originX, int originY, int originZ, float scale) {}
 
     private final WorldEngine world;
     private final Matrix4f viewProj = new Matrix4f();
     private final Map<Long, VkGraphicsPipeline> pipelines = new HashMap<>();
+    private final Map<Long, VkGraphicsPipeline> translucentPipelines = new HashMap<>();
+    /** How see through blended LOD geometry is. Water at distance, mostly. */
+    private static final float TRANSLUCENT_ALPHA = 0.75f;
     private final List<SectionDraw> draws = new ArrayList<>();
 
     private VkBuffer quadBuffer;
@@ -89,9 +93,14 @@ public class VkLodRenderer {
     //Our own depth buffer. Sharing Minecraft's is what capped the view distance at its far plane.
     private final VkDepthTarget depthTarget = new VkDepthTarget(VK_FORMAT_D32_SFLOAT);
     private VkSampler depthSampler;
+    private VkSampler lightSampler;
+    private VkTexture fallbackLightmap;
+    private VkBlockTints.Tables tints;
+    private boolean triedTints;
     private boolean failed;
     private boolean loggedDraw;
     private boolean loggedProjection;
+    private boolean loggedLightStats;
     private RenderProperties properties;
 
     /**
@@ -102,8 +111,27 @@ public class VkLodRenderer {
      * The entries are the meshed output, not the source data, so this is also what a future
      * incremental streamer allocates from rather than remeshing.
      */
-    private final LinkedHashMap<Long, long[]> meshCache = new LinkedHashMap<>(4096, 0.75f, true);
+    private final LinkedHashMap<Long, VkSectionMesher.Mesh> meshCache = new LinkedHashMap<>(4096, 0.75f, true);
     private long cachedQuads;
+
+    /**
+     * Which block ids draw translucent, resolved once on the mesh worker.
+     * <p>
+     * Built lazily rather than in the constructor because it walks every block state's model, and
+     * the renderer is created before Minecraft has necessarily finished loading them.
+     */
+    private volatile boolean[] translucentStates;
+
+    /**
+     * Which sideways faces a section has to keep, packed into the four spare low bits of its id.
+     * <p>
+     * A section on a ring edge is meshed differently from the same section in the middle of one, and
+     * which edges it is on moves with the camera - so the variant has to be part of the cache key or
+     * the two keep overwriting each other. {@code getWorldSectionId} leaves bits 0..3 unused and
+     * says so, which is exactly the four X and Z directions. A mask of zero is the ordinary interior
+     * mesh, which is the overwhelming majority and still hits the same entry it always did.
+     */
+    private static final int[] EDGE_MASK_FACES = {0, 1, 4, 5};
     //Bounded by quads rather than by section count, because sections vary enormously in size - a
     //fixed entry count is either a thrashing cache or an unbounded one depending on the terrain.
     //Twelve million quads is 96 MiB, about three times what a full range currently holds.
@@ -122,23 +150,57 @@ public class VkLodRenderer {
             new it.unimi.dsi.fastutil.longs.LongOpenHashSet();
     private static final int MAX_ABSENT_TRACKED = 1_000_000;
 
+    /** Sections ingest has rewritten since the last mesh. Written from ingest threads. */
+    private final java.util.Set<Long> dirtySections =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     /** Stores a meshed section, evicting least recently used entries to stay inside the budget. */
-    private void cacheMesh(long sectionId, long[] mesh) {
-        long[] previous = this.meshCache.put(sectionId, mesh);
+    private void cacheMesh(long cacheKey, VkSectionMesher.Mesh mesh) {
+        var previous = this.meshCache.put(cacheKey, mesh);
         if (previous != null) {
-            this.cachedQuads -= previous.length;
+            this.cachedQuads -= previous.quads().length;
         }
-        this.cachedQuads += mesh.length;
+        this.cachedQuads += mesh.quads().length;
         var iterator = this.meshCache.entrySet().iterator();
         //Access ordered, so iteration starts at the least recently used
         while (this.cachedQuads > MESH_CACHE_QUADS && this.meshCache.size() > 1 && iterator.hasNext()) {
             var eldest = iterator.next();
-            if (eldest.getKey() == sectionId) {
+            if (eldest.getKey() == cacheKey) {
                 continue;//Never evict what was just stored
             }
-            this.cachedQuads -= eldest.getValue().length;
+            this.cachedQuads -= eldest.getValue().quads().length;
             iterator.remove();
         }
+    }
+
+    /**
+     * Which of a section's four sideways neighbours are not going to be drawn at this level.
+     * <p>
+     * Meshing culls a face whenever the neighbouring section's data says solid, which is right in
+     * the middle of a ring and wrong at its edge: the neighbour exists in storage but is being drawn
+     * by a different level, at a different resolution. Voxy builds coarser levels by treating a
+     * region as solid if any block in it is, so their surfaces sit above the finer level's - and with
+     * the sideways face culled there is nothing spanning the step, so you see straight through it.
+     * <p>
+     * Returned per direction rather than as one flag. Exposing all four sides of every edge section
+     * put a full skin on three sides that did not need one, which inflated the cache enough to start
+     * evicting the interior meshes it depends on.
+     */
+    private static int ringEdgeMask(int sx, int sz, int baseX, int baseZ, int radiusXZ,
+                                    int blocksPerSection, double camX, double camZ, double inner) {
+        int mask = 0;
+        for (int i = 0; i < 4; i++) {
+            int nx = sx + (i == 0 ? -1 : i == 1 ? 1 : 0);
+            int nz = sz + (i == 2 ? -1 : i == 3 ? 1 : 0);
+            boolean undrawn = Math.abs(nx - baseX) > radiusXZ || Math.abs(nz - baseZ) > radiusXZ
+                    //Inside this level's ring, so owned by a finer one
+                    || containedInCylinder((double) nx * blocksPerSection, (double) nz * blocksPerSection,
+                            blocksPerSection, camX, camZ, inner);
+            if (undrawn) {
+                mask |= 1 << i;
+            }
+        }
+        return mask;
     }
 
     //Meshing happens off the render thread. One at a time: a second pass while one is running would
@@ -152,6 +214,9 @@ public class VkLodRenderer {
 
     /** How far the camera may drift from the last mesh centre before the rings are rebuilt. */
     private static final double REMESH_DISTANCE = 128.0;
+    /** Floor on how often newly ingested terrain alone may trigger a rebuild. */
+    private static final long DIRTY_REMESH_INTERVAL_MS = 3_000;
+    private long lastDirtyRemesh;
 
     /**
      * Buffers replaced by a rebuild, held until no recorded frame can still be reading them.
@@ -163,7 +228,65 @@ public class VkLodRenderer {
 
     public VkLodRenderer(WorldEngine world) {
         this.world = world;
+        //Ingest writes new terrain into storage as chunks load, and both caches would otherwise
+        //hold the old answer forever - a meshed section never remeshed, and worse, a section that
+        //did not exist when first asked for remembered as absent permanently. That is why a chunk
+        //loaded and then left behind never appeared as LOD.
+        world.setDirtyCallback((section, updateFlags, neighborMsk) -> this.onSectionDirty(section.key));
         Logger.info("[vk-lod] Vulkan LOD renderer created, world engine attached");
+    }
+
+    /**
+     * Marks a section as needing remeshing. Called from ingest threads, so it only enqueues - the
+     * caches belong to the mesh worker and are drained at the start of the next pass.
+     */
+    private void onSectionDirty(long sectionId) {
+        this.dirtySections.add(sectionId);
+    }
+
+    /** Drops cached answers for sections ingest has changed. Mesh worker only. */
+    private int drainDirtySections() {
+        if (this.dirtySections.isEmpty()) {
+            return 0;
+        }
+        int dropped = 0;
+        for (var iterator = this.dirtySections.iterator(); iterator.hasNext(); ) {
+            long id = iterator.next();
+            iterator.remove();
+            this.absentSections.remove(id);
+            //A section is meshed against its neighbours and cached per edge variant, so every
+            //variant of it goes, along with the six neighbours whose faces were culled against it
+            dropped += this.forgetSection(id);
+            int lvl = WorldEngine.getLevel(id);
+            int x = WorldEngine.getX(id), y = WorldEngine.getY(id), z = WorldEngine.getZ(id);
+            for (var offset : VkSectionMesher.FACE_OFFSETS) {
+                this.forgetSection(WorldEngine.getWorldSectionId(
+                        lvl, x + offset[0], y + offset[1], z + offset[2]));
+            }
+            //Coarser levels are derived from this one, so they are stale too
+            for (int parent = lvl + 1; parent <= MAX_LOD_LEVEL; parent++) {
+                int shift = parent - lvl;
+                long parentId = WorldEngine.getWorldSectionId(
+                        parent, x >> shift, y >> shift, z >> shift);
+                this.absentSections.remove(parentId);
+                this.forgetSection(parentId);
+            }
+        }
+        return dropped;
+    }
+
+    /** Removes every cached edge variant of one section, returning how many were held. */
+    private int forgetSection(long sectionId) {
+        int removed = 0;
+        //The low four bits are the edge mask, so the variants are sectionId through sectionId | 15
+        for (int mask = 0; mask < 16; mask++) {
+            var previous = this.meshCache.remove(sectionId | mask);
+            if (previous != null) {
+                this.cachedQuads -= previous.quads().length;
+                removed++;
+            }
+        }
+        return removed;
     }
 
     public static void setActive(VkLodRenderer renderer) {
@@ -187,7 +310,8 @@ public class VkLodRenderer {
     /** The result of a meshing pass: every quad packed back to back, plus where each section sits. */
     private record MeshResult(long[] quads, List<SectionDraw> draws, int maxQuadsPerSection,
                               double centreX, double centreZ, int sectionsMeshed, double millis,
-                              int cacheHits, int cacheMisses) {}
+                              int cacheHits, int cacheMisses, int edgeSections, int invalidated,
+                              int partialThroughLevel) {}
 
     /**
      * Meshes the sections around a point and packs them, touching nothing owned by the GPU.
@@ -196,7 +320,7 @@ public class VkLodRenderer {
      * mesh worker thread. Everything it needs is either a parameter or the section cache, and
      * everything it produces goes back in the returned result for the render thread to upload.
      */
-    private MeshResult buildMesh(double cameraX, double cameraY, double cameraZ) {
+    private MeshResult buildMesh(double cameraX, double cameraY, double cameraZ, boolean progressive) {
         long start = System.nanoTime();
         var allQuads = new LongArrayList();
         var builtDraws = new ArrayList<SectionDraw>();
@@ -204,7 +328,30 @@ public class VkLodRenderer {
         int maxQuadsPerSection = 0;
         int cacheHits = 0;
         int cacheMisses = 0;
+        int edgeSections = 0;
+        int invalidated = this.drainDirtySections();
         double range = lodRangeBlocks();
+        //Resolved on this thread, once. Voxy's own bakery walks block models off the render thread
+        //too, so this is the same access pattern rather than a new one.
+        boolean[] translucentTable = this.translucentStates;
+        if (translucentTable == null) {
+            try {
+                translucentTable = VkBlockTints.buildTranslucentStates(this.world.getMapper());
+                //Only kept on success. A failure here usually means Minecraft has not finished
+                //loading models yet, and caching that answer would make everything opaque forever.
+                this.translucentStates = translucentTable;
+                //Anything meshed before the table existed was split as fully opaque, so it would
+                //keep drawing water as solid no matter how many rebuilds ran over it
+                if (!this.meshCache.isEmpty()) {
+                    this.meshCache.clear();
+                    this.cachedQuads = 0;
+                }
+            } catch (Throwable t) {
+                Logger.warn("[vk-lod] translucent block states not resolvable yet, drawing opaque"
+                        + " for now: " + t);
+                translucentTable = null;
+            }
+        }
 
         //Ring boundaries are still anchored at vanilla's edge, so the finest LOD level lands just
         //outside it rather than being wasted underneath it. Effective, not the raw option: on a
@@ -302,16 +449,24 @@ public class VkLodRenderer {
                         }
 
                         long sectionId = WorldEngine.getWorldSectionId(lvl, sx, sy, sz);
+                        int edgeMask = ringEdgeMask(sx, sz, baseX, baseZ, radiusXZ,
+                                blocksPerSection, cameraX, cameraZ, lvl > 0 ? inner : 0);
+                        //The mask rides in the id's spare low bits, so an edge variant and the
+                        //ordinary interior mesh are separate entries in the one cache
+                        long cacheKey = sectionId | edgeMask;
+                        if (edgeMask != 0) {
+                            edgeSections++;
+                        }
                         //A section already meshed on an earlier pass is reused as is. Travelling
                         //only changes which sections are in range, not what any of them look like,
                         //so without this every rebuild would redo the entire world from storage.
-                        long[] meshed = this.meshCache.get(sectionId);
+                        var meshed = this.meshCache.get(cacheKey);
                         if (meshed != null) {
                             cacheHits++;
                             //Cached and empty is still cached - it stands for a section that exists
                             //but produced no geometry, which is exactly what coverage means here
                             coveredThisLevel.add(sectionId);
-                            if (meshed.length == 0) {
+                            if (meshed.quads().length == 0) {
                                 continue;
                             }
                         } else {
@@ -329,19 +484,27 @@ public class VkLodRenderer {
                                 var o = VkSectionMesher.FACE_OFFSETS[f];
                                 neighbours[f] = sectionData(cache, lvl, sx + o[0], sy + o[1], sz + o[2]);
                             }
+                            //Left null where the neighbour is not being drawn at this level, which
+                            //the mesher reads as air and so keeps the face, closing the step down to
+                            //whatever the coarser level drew. Y is never masked - the sections above
+                            //and below are always the same level as this one.
+                            for (int i = 0; i < 4; i++) {
+                                if ((edgeMask & (1 << i)) != 0) {
+                                    neighbours[EDGE_MASK_FACES[i]] = null;
+                                }
+                            }
 
-                            var quads = VkSectionMesher.mesh(data, neighbours);
-                            meshed = quads.toLongArray();
-                            this.cacheMesh(sectionId, meshed);
-                            if (meshed.length == 0) {
+                            meshed = VkSectionMesher.mesh(data, neighbours, translucentTable);
+                            this.cacheMesh(cacheKey, meshed);
+                            if (meshed.quads().length == 0) {
                                 continue;
                             }
                         }
 
                         int first = allQuads.size();
-                        allQuads.addElements(first, meshed);
-                        maxQuadsPerSection = Math.max(maxQuadsPerSection, meshed.length);
-                        builtDraws.add(new SectionDraw(first, meshed.length,
+                        allQuads.addElements(first, meshed.quads());
+                        maxQuadsPerSection = Math.max(maxQuadsPerSection, meshed.quads().length);
+                        builtDraws.add(new SectionDraw(first, meshed.quads().length, meshed.opaqueCount(),
                                 sx * blocksPerSection, sy * blocksPerSection, sz * blocksPerSection,
                                 1 << lvl));
                         sectionsMeshed++;
@@ -354,13 +517,25 @@ public class VkLodRenderer {
                         + (int) inner + "-" + (int) outer + " blocks"
                         + (skippedInsideRing > 0 ? " (" + skippedInsideRing + " skipped inside ring)" : ""));
             }
+            //On a cold start there is nothing on screen until the whole sweep finishes, which is
+            //the better part of ten seconds because no cache is warm yet. Publishing each level as
+            //it lands puts the nearest terrain up in about a second and fills outwards, at the cost
+            //of re-uploading the buffer once per level - which is only paid when there is nothing
+            //to show anyway.
+            if (progressive && lvl < MAX_LOD_LEVEL && !allQuads.isEmpty()) {
+                this.completedMesh.set(new MeshResult(allQuads.toLongArray(),
+                        new ArrayList<>(builtDraws), maxQuadsPerSection, cameraX, cameraZ,
+                        sectionsMeshed, (System.nanoTime() - start) / 1_000_000.0,
+                        cacheHits, cacheMisses, edgeSections, invalidated, lvl));
+            }
             inner = outer;
             coveredByFiner = coveredThisLevel;
         }
 
         double ms = (System.nanoTime() - start) / 1_000_000.0;
         return new MeshResult(allQuads.toLongArray(), builtDraws, maxQuadsPerSection,
-                cameraX, cameraZ, sectionsMeshed, ms, cacheHits, cacheMisses);
+                cameraX, cameraZ, sectionsMeshed, ms, cacheHits, cacheMisses, edgeSections,
+                invalidated, -1);
     }
 
     /**
@@ -394,19 +569,62 @@ public class VkLodRenderer {
         if (this.colourBuffer == null) {
             this.colourBuffer = this.buildColourTable();
         }
+        //Attempted once. Resolving tints walks every block state against every biome and touches a
+        //lot of Minecraft, so a failure here drops back to untinted rather than taking the renderer
+        //down - grass being one shade is a far smaller problem than no terrain at all.
+        if (!this.triedTints) {
+            this.triedTints = true;
+            try {
+                this.tints = VkBlockTints.build(this.world.getMapper());
+            } catch (Throwable t) {
+                Logger.error("[vk-lod] could not build biome tint tables, rendering untinted", t);
+                //Falls back to a table that tints nothing rather than leaving the binding null,
+                //which would stop the draw happening at all
+                this.tints = VkBlockTints.empty();
+            }
+        }
 
         this.retireBuffer(this.quadBuffer);
         this.quadBuffer = newQuads;
         this.draws.clear();
         this.draws.addAll(result.draws());
+        this.lastQuadCount = quads.length;
+        this.lastMeshMillis = result.millis();
+
+        //Lighting reads index zero as fully lit, because that is what an unpopulated value looks
+        //like. This says which it actually is: if almost every quad reports zero the stored light
+        //is not there and the world is being drawn unlit rather than lit.
+        if (!this.loggedLightStats) {
+            this.loggedLightStats = true;
+            int sampled = 0;
+            int lit = 0;
+            int step = Math.max(1, quads.length / 4096);
+            for (int i = 0; i < quads.length; i += step) {
+                sampled++;
+                if (((quads[i] >>> 55) & 0xFF) != 0) {
+                    lit++;
+                }
+            }
+            Logger.info("[vk-lod] light data: " + lit + " of " + sampled
+                    + " sampled quads carry a non zero light value"
+                    + (lit == 0 ? " - LIGHTING IS BEING SKIPPED, terrain will draw fullbright" : ""));
+        }
 
         int total = result.cacheHits() + result.cacheMisses();
+        if (result.partialThroughLevel() >= 0) {
+            Logger.info("[vk-lod] partial: levels 0-" + result.partialThroughLevel() + " up, "
+                    + result.sectionsMeshed() + " sections, " + quads.length + " quads at "
+                    + String.format("%.0f", result.millis()) + " ms");
+            return;
+        }
         Logger.info("[vk-lod] meshed " + result.sectionsMeshed() + " saved sections into "
                 + quads.length + " quads (" + (quadBytes >> 10) + " KiB) out to "
                 + (int) lodRangeBlocks() + " blocks in " + String.format("%.1f", result.millis())
                 + " ms (" + result.cacheHits() + "/" + total + " from cache, "
-                + this.meshCache.size() + " sections / " + (this.cachedQuads / 1000) + "k quads cached, "
-                + this.absentSections.size() + " known absent)");
+                + this.meshCache.size() + " cached / " + (this.cachedQuads / 1000) + "k quads, "
+                + result.edgeSections() + " ring edge, "
+                + this.absentSections.size() + " known absent"
+                + (result.invalidated() > 0 ? ", " + result.invalidated() + " invalidated" : "") + ")");
     }
 
     /**
@@ -655,8 +873,17 @@ public class VkLodRenderer {
         if (!first) {
             double dx = cameraX - this.meshedCentreX;
             double dz = cameraZ - this.meshedCentreZ;
-            if (dx * dx + dz * dz < REMESH_DISTANCE * REMESH_DISTANCE) {
+            boolean moved = dx * dx + dz * dz >= REMESH_DISTANCE * REMESH_DISTANCE;
+            //Ingest rewriting terrain is the other reason to rebuild, but it fires constantly while
+            //chunks stream in, so it is rate limited rather than acted on the moment it arrives
+            long now = System.currentTimeMillis();
+            boolean dirty = !this.dirtySections.isEmpty()
+                    && now - this.lastDirtyRemesh >= DIRTY_REMESH_INTERVAL_MS;
+            if (!moved && !dirty) {
                 return;
+            }
+            if (dirty) {
+                this.lastDirtyRemesh = now;
             }
         }
         //Claimed before the task is handed over, so a frame between submit and the worker starting
@@ -672,9 +899,12 @@ public class VkLodRenderer {
                 return thread;
             });
         }
+        //Only publish level by level when there is nothing on screen yet, so the extra uploads are
+        //paid exactly when they buy something
+        boolean progressive = this.quadBuffer == null;
         this.meshWorker.execute(() -> {
             try {
-                this.completedMesh.set(this.buildMesh(cameraX, cameraY, cameraZ));
+                this.completedMesh.set(this.buildMesh(cameraX, cameraY, cameraZ, progressive));
             } catch (Throwable t) {
                 Logger.error("[vk-lod] meshing failed on the worker thread", t);
             } finally {
@@ -767,7 +997,26 @@ public class VkLodRenderer {
     private int passDepthFormat;
     private int passWidth;
     private int passHeight;
+    private long passLightmapView;
     private boolean drawQueued;
+
+    /**
+     * Minecraft's level lightmap as a raw Vulkan image view, or null if it is not available yet.
+     * <p>
+     * This is the same 16x16 texture vanilla terrain samples, so LOD terrain picks up block and sky
+     * light identically rather than needing a lighting model of its own.
+     */
+    private static long lightmapImageView() {
+        try {
+            var view = Minecraft.getInstance().gameRenderer.levelLightmap();
+            if (view instanceof com.mojang.blaze3d.vulkan.VulkanGpuTextureView vk) {
+                return vk.vkImageView();
+            }
+        } catch (Throwable ignored) {
+            //Not available this early in a frame, or the dimension is mid swap
+        }
+        return VK_NULL_HANDLE;
+    }
 
     /**
      * Called as Minecraft's terrain pass is submitted, while its attachments are still identifiable.
@@ -831,7 +1080,27 @@ public class VkLodRenderer {
                 //texelFetch does no filtering, but GLSL still wants a combined image sampler
                 this.depthSampler = new VkSampler(VK_FILTER_NEAREST, VK_FILTER_NEAREST,
                         VK_SAMPLER_MIPMAP_MODE_NEAREST, 0.0f, 0.0f);
+                //Linear across the lightmap, matching how vanilla samples it, so light levels blend
+                this.lightSampler = new VkSampler(VK_FILTER_LINEAR, VK_FILTER_LINEAR,
+                        VK_SAMPLER_MIPMAP_MODE_NEAREST, 0.0f, 0.0f);
             }
+            if (this.tints == null) {
+                return;//The first upload has not happened yet, so there is nothing to draw anyway
+            }
+            //Fetched per frame rather than cached: Minecraft rebuilds the lightmap view whenever the
+            //dimension or resource pack changes, and a stale view is a dangling handle
+            long lightmapView = lightmapImageView();
+            if (lightmapView == VK_NULL_HANDLE) {
+                //A single white pixel stands in, so terrain still draws - at full brightness rather
+                //than not at all. Skipping the frame instead would mean that if the lightmap never
+                //turned up, nothing would ever render and the cause would be invisible.
+                if (this.fallbackLightmap == null) {
+                    this.fallbackLightmap = VkTexture.singlePixel(0xFFFFFFFF);
+                    Logger.warn("[vk-lod] level lightmap unavailable, lighting LODs at full brightness");
+                }
+                lightmapView = this.fallbackLightmap.imageView;
+            }
+            this.passLightmapView = lightmapView;
 
             long key = ((long) this.passColorFormat << 32) | (this.passDepthFormat & 0xFFFFFFFFL);
             var pipeline = this.pipelines.get(key);
@@ -840,14 +1109,23 @@ public class VkLodRenderer {
                         ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;
                 //Depth writes on: LOD geometry should occlude itself correctly. The depth format is
                 //our own target's, not the pass's, since that is what the pipeline renders against.
+                //Four storage buffers (quads, block colours, tint offsets, tint colours) then two
+                //samplers (Minecraft's depth, Minecraft's lightmap)
                 pipeline = new VkGraphicsPipeline(
                         "voxy:vk/lod_quads.vert", "voxy:vk/lod_quads.frag",
                         this.passColorFormat, VK_FORMAT_D32_SFLOAT,
-                        true, true, compareOp, PUSH_CONSTANT_SIZE, 2, 1, VK_CULL_MODE_NONE);
+                        true, true, compareOp, PUSH_CONSTANT_SIZE, 4, 2, VK_CULL_MODE_NONE);
                 this.pipelines.put(key, pipeline);
-                Logger.info("[vk-lod] built LOD pipeline, colour format " + this.passColorFormat
+                //Same shaders, blended, and writing no depth - translucent surfaces must not hide
+                //the translucent surfaces behind them, only be hidden by opaque ones in front
+                this.translucentPipelines.put(key, new VkGraphicsPipeline(
+                        "voxy:vk/lod_quads.vert", "voxy:vk/lod_quads.frag",
+                        this.passColorFormat, VK_FORMAT_D32_SFLOAT,
+                        true, false, compareOp, PUSH_CONSTANT_SIZE, 4, 2, VK_CULL_MODE_NONE, true));
+                Logger.info("[vk-lod] built LOD pipelines, colour format " + this.passColorFormat
                         + ", own depth target " + width + "x" + height);
             }
+            var translucentPipeline = this.translucentPipelines.get(key);
 
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 this.depthTarget.ensureLayout(cmd);
@@ -879,7 +1157,9 @@ public class VkLodRenderer {
                 renderingInfo.renderArea().extent().set(width, height);
 
                 vkCmdBeginRenderingKHR(cmd, renderingInfo);
-                this.recordDraws(cmd, pipeline, stack, width, height);
+                //Opaque first so it fills the depth buffer, then the blended pass on top of it
+                this.recordDraws(cmd, pipeline, stack, width, height, false);
+                this.recordDraws(cmd, translucentPipeline, stack, width, height, true);
                 vkCmdEndRenderingKHR(cmd);
 
                 //And our colour writes have to land before Minecraft's next pass touches the target
@@ -891,10 +1171,13 @@ public class VkLodRenderer {
     }
 
     private void recordDraws(VkCommandBuffer cmd, VkGraphicsPipeline pipeline, MemoryStack stack,
-                             int width, int height) {
+                             int width, int height, boolean translucentPass) {
         pipeline.bind(cmd, width, height);
-        pipeline.bindResources(cmd, new VkBuffer[]{this.quadBuffer, this.colourBuffer},
-                new long[]{this.passDepthView}, new VkSampler[]{this.depthSampler},
+        pipeline.bindResources(cmd,
+                new VkBuffer[]{this.quadBuffer, this.colourBuffer,
+                        this.tints.stateOffsets(), this.tints.colours()},
+                new long[]{this.passDepthView, this.passLightmapView},
+                new VkSampler[]{this.depthSampler, this.lightSampler},
                 VK_IMAGE_LAYOUT_GENERAL);
         vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
@@ -910,10 +1193,19 @@ public class VkLodRenderer {
         //The depth value that means Minecraft drew nothing here, which is what the fragment shader
         //tests against to decide whether vanilla terrain already owns the pixel
         push.putFloat(80, this.properties.clearDepth());
-        push.putFloat(84, 0f);
-        push.putFloat(88, 0f);
+        push.putFloat(84, this.tints.biomeCount());
+        //Alpha the fragment shader writes. Opaque geometry is fully opaque; the blended pass uses a
+        //flat value rather than a per block one, because the map colour table carries no alpha.
+        push.putFloat(88, translucentPass ? TRANSLUCENT_ALPHA : 1.0f);
         push.putFloat(92, 0f);
         for (var draw : this.draws) {
+            //Each section's quads are packed opaque first, translucent after, so a pass is a
+            //contiguous slice of the same buffer rather than a separate one
+            int first = translucentPass ? draw.firstQuad() + draw.opaqueCount() : draw.firstQuad();
+            int count = translucentPass ? draw.quadCount() - draw.opaqueCount() : draw.opaqueCount();
+            if (count <= 0) {
+                continue;
+            }
             //Sodium renders camera relative, so section origins are offsets from the camera
             float ox = (float) (draw.originX() - this.camX);
             float oy = (float) (draw.originY() - this.camY);
@@ -931,17 +1223,45 @@ public class VkLodRenderer {
             //The index buffer only ever describes one section's worth of quads, starting at zero.
             //vertexOffset slides gl_VertexIndex onto this section's quads, so the same indices serve
             //every draw - which is what keeps it a few hundred KiB instead of scaling with the world.
-            vkCmdDrawIndexed(cmd, draw.quadCount() * 6, 1, 0, draw.firstQuad() * 4, 0);
+            vkCmdDrawIndexed(cmd, count * 6, 1, 0, first * 4, 0);
             drawn++;
-            quadsDrawn += draw.quadCount();
+            quadsDrawn += count;
         }
 
-        if (!this.loggedDraw) {
+        if (!this.loggedDraw && !translucentPass) {
             this.loggedDraw = true;
             Logger.info("[vk-lod] RENDERING " + drawn + " of " + this.draws.size()
-                    + " sections after frustum culling (" + quadsDrawn + " quads)");
+                    + " sections after frustum culling (" + quadsDrawn + " opaque quads)");
         }
     }
+
+    /**
+     * Forces the rings to be rebuilt after the configured render distance changes.
+     * <p>
+     * The meshes themselves stay cached - a section looks the same whatever the range is - so this
+     * only has to make the next frame decide it has moved far enough to rebuild.
+     */
+    public void onRenderDistanceChanged() {
+        this.meshedCentreX = Double.NaN;
+        this.meshedCentreZ = Double.NaN;
+        Logger.info("[vk-lod] render distance changed, rebuilding to "
+                + (int) lodRangeBlocks() + " blocks");
+    }
+
+    /** Fills the F3 screen with what this renderer is actually doing. Render thread only. */
+    public void addDebugInfo(List<String> debug) {
+        debug.add(String.format("Voxy-VK: %d sections, %d quads, %.1f MiB geometry",
+                this.draws.size(), this.lastQuadCount, this.lastQuadCount * 8.0 / (1024 * 1024)));
+        debug.add(String.format("Voxy-VK mesh: %.0f ms last, %s, range %d",
+                this.lastMeshMillis, this.meshInFlight ? "rebuilding" : "idle",
+                (int) lodRangeBlocks()));
+        debug.add(String.format("Voxy-VK cache: %d sections, %dk quads, %d absent, %d dirty",
+                this.meshCache.size(), this.cachedQuads / 1000,
+                this.absentSections.size(), this.dirtySections.size()));
+    }
+
+    private int lastQuadCount;
+    private double lastMeshMillis;
 
     /** Reads a projection's far plane back out of it, for logging. */
     private static String describeFarPlane(Matrix4fc projection) {
@@ -993,6 +1313,13 @@ public class VkLodRenderer {
             }
             this.meshWorker = null;
         }
+        //Dropped before the caches, so ingest cannot enqueue into a renderer being torn down
+        try {
+            this.world.setDirtyCallback(null);
+        } catch (Throwable ignored) {
+            //Teardown must not be blocked by the world already being gone
+        }
+        this.dirtySections.clear();
         this.meshCache.clear();
         this.cachedQuads = 0;
         this.absentSections.clear();
@@ -1007,6 +1334,10 @@ public class VkLodRenderer {
                 pipeline.free();
             }
             this.pipelines.clear();
+            for (var pipeline : this.translucentPipelines.values()) {
+                pipeline.free();
+            }
+            this.translucentPipelines.clear();
             if (this.quadBuffer != null) {
                 this.quadBuffer.free();
                 this.quadBuffer = null;
@@ -1023,6 +1354,18 @@ public class VkLodRenderer {
             if (this.depthSampler != null) {
                 this.depthSampler.free();
                 this.depthSampler = null;
+            }
+            if (this.lightSampler != null) {
+                this.lightSampler.free();
+                this.lightSampler = null;
+            }
+            if (this.fallbackLightmap != null) {
+                this.fallbackLightmap.free();
+                this.fallbackLightmap = null;
+            }
+            if (this.tints != null) {
+                this.tints.free();
+                this.tints = null;
             }
             this.drawQueued = false;
             this.passCmd = null;

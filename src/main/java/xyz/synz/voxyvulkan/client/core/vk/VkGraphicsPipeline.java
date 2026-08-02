@@ -66,6 +66,20 @@ public class VkGraphicsPipeline extends TrackedObject {
                               int colorFormat, int depthFormat,
                               boolean depthTest, boolean depthWrite, int depthCompareOp,
                               int pushConstantSize, int bindingCount, int textureCount, int cullMode) {
+        this(vertexShaderId, fragmentShaderId, colorFormat, depthFormat, depthTest, depthWrite,
+                depthCompareOp, pushConstantSize, bindingCount, textureCount, cullMode, false);
+    }
+
+    /**
+     * @param blend enables standard source alpha blending, for the translucent pass. Translucent
+     *              geometry also wants depth testing without depth writing, so that it is occluded
+     *              by what is in front of it without hiding the translucent surfaces behind it.
+     */
+    public VkGraphicsPipeline(String vertexShaderId, String fragmentShaderId,
+                              int colorFormat, int depthFormat,
+                              boolean depthTest, boolean depthWrite, int depthCompareOp,
+                              int pushConstantSize, int bindingCount, int textureCount, int cullMode,
+                              boolean blend) {
         this.bindingCount = bindingCount;
         this.textureCount = textureCount;
         var ctx = VkContext.get();
@@ -102,7 +116,9 @@ public class VkGraphicsPipeline extends TrackedObject {
                             .binding(bindingCount + i)
                             .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                             .descriptorCount(1)
-                            .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
+                            //Vertex too: per quad values like the lightmap lookup are constant
+                            //across the quad, so sampling once per vertex beats once per fragment
+                            .stageFlags(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
                 }
                 //Push descriptors: the bindings travel in the command buffer rather than living in
                 //a set we own. Voxy's geometry buffers are replaced wholesale whenever the world is
@@ -161,7 +177,13 @@ public class VkGraphicsPipeline extends TrackedObject {
 
             var blendAttachment = VkPipelineColorBlendAttachmentState.calloc(1, stack);
             blendAttachment.get(0)
-                    .blendEnable(false)
+                    .blendEnable(blend)
+                    .srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
+                    .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                    .colorBlendOp(VK_BLEND_OP_ADD)
+                    .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
+                    .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                    .alphaBlendOp(VK_BLEND_OP_ADD)
                     .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
                             | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
             var colorBlend = VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default()

@@ -16,12 +16,25 @@ layout(std430, binding = 1) restrict readonly buffer ColourBuffer {
     uint blockColours[];
 };
 
+//Where a block state's per biome colours start, or -1 when the state is not tinted at all
+layout(std430, binding = 2) restrict readonly buffer TintOffsetBuffer {
+    int stateTintOffset[];
+};
+
+//One colour per (tinted state, biome), packed ABGR
+layout(std430, binding = 3) restrict readonly buffer TintColourBuffer {
+    uint tintColours[];
+};
+
+//Minecraft's own lightmap, so block and sky light read the same as they do up close
+layout(binding = 5) uniform sampler2D lightmap;
+
 //Must stay byte for byte identical to the block in lod_quads.frag - one push constant range is
 //shared by both stages, so a mismatch silently misreads whichever stage disagrees
 layout(push_constant) uniform PushConstants {
     mat4 viewProj;
     vec4 params;//xyz = section origin, camera relative; w = scale of one voxel at this LOD level
-    vec4 depthParams;//x = the depth value meaning 'Minecraft drew nothing on this pixel'
+    vec4 depthParams;//x = the depth value meaning 'Minecraft drew nothing'; y = biome count
 } pc;
 
 layout(location = 0) out vec3 vColor;
@@ -36,12 +49,50 @@ vec3 planeOffset(uint axis, vec2 uv) {
     return vec3(uv.x, uv.y, 0.0);
 }
 
+vec3 unpackABGR(uint packed) {
+    return vec3(float(packed & 255u), float((packed >> 8) & 255u), float((packed >> 16) & 255u)) / 255.0;
+}
+
 vec3 stateColour(uint stateId) {
     if (stateId >= uint(blockColours.length())) {
         return vec3(0.5);
     }
-    uint packed = blockColours[stateId];
-    return vec3(float(packed & 255u), float((packed >> 8) & 255u), float((packed >> 16) & 255u)) / 255.0;
+    return unpackABGR(blockColours[stateId]);
+}
+
+//The colour a tinted block should actually be in this biome, or -1 alpha meaning 'not tinted'.
+//
+//This replaces the base colour rather than multiplying it. Minecraft tints a greyscale texture, but
+//what we have to start from is the block's map colour, which already has the tint baked in - grass
+//is green before any biome is applied. Multiplying would apply the green twice and come out muddy,
+//whereas the biome colour on its own is exactly the answer for the cases tinting exists for.
+//The table is resolved on the CPU because a LOD quad spans many blocks and has no world to ask.
+vec4 biomeTint(uint stateId, uint biomeId) {
+    if (stateId >= uint(stateTintOffset.length())) {
+        return vec4(0.0, 0.0, 0.0, -1.0);
+    }
+    int offset = stateTintOffset[stateId];
+    if (offset < 0) {
+        return vec4(0.0, 0.0, 0.0, -1.0);//Not a tinted state, which is nearly all of them
+    }
+    uint biomeCount = uint(max(pc.depthParams.y, 1.0));
+    uint index = uint(offset) + min(biomeId, biomeCount - 1u);
+    if (index >= uint(tintColours.length())) {
+        return vec4(0.0, 0.0, 0.0, -1.0);
+    }
+    return vec4(unpackABGR(tintColours[index]), 1.0);
+}
+
+//Index zero is deliberately read as fully lit rather than as pitch black. It is what an unpopulated
+//light value looks like, and getting that wrong the other way turns the entire world black - a
+//slightly over-bright cave is a much better failure than a world that renders as nothing.
+vec3 lightFor(uint lightId) {
+    if (lightId == 0u) {
+        return vec3(1.0);
+    }
+    vec2 base = vec2(float((lightId >> 4u) & 15u), float(lightId & 15u)) / 15.0;
+    vec2 uv = clamp(base * (15.0 / 16.0) + (0.5 / 16.0), vec2(8.0 / 256.0), vec2(248.0 / 256.0));
+    return textureLod(lightmap, uv, 0.0).rgb;
 }
 
 void main() {
@@ -69,7 +120,13 @@ void main() {
     vec3 world = pc.params.xyz + local * pc.params.w;
     gl_Position = pc.viewProj * vec4(world, 1.0);
 
-    //Flat directional shading so the geometry reads as solid rather than a colour field
+    //Flat directional shading so the geometry reads as solid rather than a colour field. This is
+    //separate from the lightmap, exactly as it is in vanilla - one is which way the face points,
+    //the other is how much light reaches it.
     float shade = (axis == 1u) ? ((face & 1u) == 1u ? 1.0 : 0.5) : (axis == 0u ? 0.8 : 0.65);
-    vColor = stateColour(extractStateId(quad)) * shade;
+
+    uint stateId = extractStateId(quad);
+    vec4 tint = biomeTint(stateId, extractBiomeId(quad));
+    vec3 base = tint.a < 0.0 ? stateColour(stateId) : tint.rgb;
+    vColor = base * lightFor(extractLightId(quad)) * shade;
 }

@@ -15,13 +15,13 @@ layout(location = 0) out vec4 fragColor;
 //them numerically is meaningless. What survives the difference is whether vanilla drew anything
 //here at all: where it did, it owns the pixel and we stay out of the way. This is voxy's OpenGL
 //path's stencil mask, done as a texture read because Minecraft's Vulkan depth target has no stencil.
-layout(binding = 2) uniform sampler2D vanillaDepth;
+layout(binding = 4) uniform sampler2D vanillaDepth;
 
 //Must stay byte for byte identical to the block in lod_quads.vert
 layout(push_constant) uniform PushConstants {
     mat4 viewProj;
     vec4 params;
-    vec4 depthParams;//x = the depth value meaning 'Minecraft drew nothing on this pixel'
+    vec4 depthParams;//x = 'Minecraft drew nothing' depth; y = biome count; z = output alpha
 } pc;
 
 void main() {
@@ -30,5 +30,5 @@ void main() {
     if (texelFetch(vanillaDepth, ivec2(gl_FragCoord.xy), 0).r != pc.depthParams.x) {
         discard;
     }
-    fragColor = vec4(vColor, 1.0);
+    fragColor = vec4(vColor, pc.depthParams.z);
 }

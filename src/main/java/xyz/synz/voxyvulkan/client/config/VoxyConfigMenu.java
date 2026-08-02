@@ -115,6 +115,12 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                                                 //CFG.sectionRenderDistance == c/16
                                                 vrs.setRenderDistance(CFG.sectionRenderDistance);
                                             }
+                                            //On Vulkan the OpenGL render system is never created, so
+                                            //without this the slider silently did nothing at all
+                                            var lod = xyz.synz.voxyvulkan.client.core.vk.VkLodRenderer.getActive();
+                                            if (lod != null) {
+                                                lod.onRenderDistanceChanged();
+                                            }
                                         }, "voxy:rendering", RENDER_RELOAD)
                                         .setImpact(OptionImpact.MEDIUM)
                         ), new Group(

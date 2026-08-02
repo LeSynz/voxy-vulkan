@@ -32,9 +32,18 @@ public class VoxyDebugScreenEntry implements DebugScreenEntry {
         instance.addDebug(instanceLines);
         lines.addToGroup(Identifier.fromNamespaceAndPath("voxy", "instance_debug"), instanceLines);
 
+        List<String> renderLines = new ArrayList<>();
         if (vrs != null) {
-            List<String> renderLines = new ArrayList<>();
             vrs.addDebugInfo(renderLines);
+        } else {
+            //On Vulkan the OpenGL render system is never created, so its debug lines never appear.
+            //The Vulkan renderer keeps the same kind of numbers and they are just as worth seeing.
+            var lod = xyz.synz.voxyvulkan.client.core.vk.VkLodRenderer.getActive();
+            if (lod != null) {
+                lod.addDebugInfo(renderLines);
+            }
+        }
+        if (!renderLines.isEmpty()) {
             lines.addToGroup(Identifier.fromNamespaceAndPath("voxy", "render_debug"), renderLines);
         }
     }

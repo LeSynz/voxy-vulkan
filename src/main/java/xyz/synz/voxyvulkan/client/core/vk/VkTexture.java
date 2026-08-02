@@ -92,6 +92,31 @@ public class VkTexture extends TrackedObject {
         VkContext.get().submitBlocking(cmd -> transition(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
     }
 
+    /**
+     * A one pixel texture of a single colour, for standing in where a real one is not available.
+     * Sampling it always returns that colour, so a missing texture degrades to a constant rather
+     * than to a binding that cannot be made and a draw that therefore never happens.
+     */
+    public static VkTexture singlePixel(int argb) {
+        var texture = new VkTexture(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1);
+        long scratch = MemoryUtil.nmemAlloc(4);
+        try {
+            //Stored RGBA in memory order, which is what R8G8B8A8_UNORM reads
+            MemoryUtil.memPutByte(scratch, (byte) ((argb >> 16) & 0xFF));
+            MemoryUtil.memPutByte(scratch + 1, (byte) ((argb >> 8) & 0xFF));
+            MemoryUtil.memPutByte(scratch + 2, (byte) (argb & 0xFF));
+            MemoryUtil.memPutByte(scratch + 3, (byte) ((argb >>> 24) & 0xFF));
+            texture.uploadSubImage(0, 0, 0, 1, 1, scratch);
+        } finally {
+            MemoryUtil.nmemFree(scratch);
+        }
+        //Left in GENERAL rather than the usual SHADER_READ_ONLY_OPTIMAL. This stands in for one of
+        //Minecraft's textures, and Minecraft keeps everything it owns in GENERAL, so it is bound
+        //through the same descriptor write and has to agree with the layout that write declares.
+        VkContext.get().submitBlocking(cmd -> texture.transition(cmd, VK_IMAGE_LAYOUT_GENERAL));
+        return texture;
+    }
+
     public long getEstimatedSize() {
         //Base level plus the mip chain, which converges to about 4/3 of the base
         return (long) this.width * this.height * 4L * 4L / 3L;

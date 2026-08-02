@@ -56,7 +56,8 @@ public class VkSectionMesher {
         return !Mapper.isAir(neighbour[index(x & 31, y & 31, z & 31)]);
     }
 
-    private static long packQuad(int face, int sizeX, int sizeY, int x, int y, int z, int stateId) {
+    private static long packQuad(int face, int sizeX, int sizeY, int x, int y, int z,
+                                 int stateId, int biomeId, int lightId) {
         long quad = 0;
         quad |= (long) (face & 0x7);
         quad |= (long) ((sizeX - 1) & 0xF) << 3;
@@ -65,14 +66,46 @@ public class VkSectionMesher {
         quad |= (long) (y & 0x1F) << 16;
         quad |= (long) (x & 0x1F) << 21;
         quad |= (long) (stateId & 0xFFFF) << 26;
+        //Bits 46 and 55 to match quad_format.glsl, which already knows how to read them back
+        quad |= (long) (biomeId & 0x1FF) << 46;
+        quad |= (long) (lightId & 0xFF) << 55;
         return quad;
     }
 
-    public static LongArrayList mesh(long[] data, long[][] neighbours) {
-        var quads = new LongArrayList();
+    /**
+     * The three per voxel values that have to match for two voxels to merge into one quad, packed
+     * into one comparable key.
+     * <p>
+     * Merging on the block alone would be cheaper, but then a merged quad has to pick one voxel's
+     * lighting and biome for the whole run, which shows up as flat blotches across a shaded hillside
+     * and as biome colour bleeding across borders.
+     */
+    private static long mergeKey(long voxel) {
+        return (Mapper.getBlockId(voxel) & 0xFFFFFL)
+                | ((long) (Mapper.getBiomeId(voxel) & 0x1FF) << 20)
+                | ((long) (Mapper.getLightId(voxel) & 0xFF) << 29);
+    }
 
-        //Reused per slice: 0 means no face here, otherwise stateId+1
-        int[] mask = new int[SECTION_WIDTH * SECTION_WIDTH];
+    /**
+     * A section's quads with the translucent ones moved to the end.
+     * <p>
+     * Kept as one array with a split point rather than two arrays, because the renderer draws from
+     * one buffer and only needs to know where to stop for the opaque pass and where to start for the
+     * blended one.
+     */
+    public record Mesh(long[] quads, int opaqueCount) {}
+
+    /**
+     * @param translucentStates indexed by block id, true where the block draws blended. Null renders
+     *                          everything opaque, which is the correct fallback if the table could
+     *                          not be built.
+     */
+    public static Mesh mesh(long[] data, long[][] neighbours, boolean[] translucentStates) {
+        var quads = new LongArrayList();
+        var translucent = new LongArrayList();
+
+        //Reused per slice: 0 means no face here, otherwise the merge key plus one
+        long[] mask = new long[SECTION_WIDTH * SECTION_WIDTH];
 
         for (int face = 0; face < 6; face++) {
             int axis = face >> 1;
@@ -98,21 +131,29 @@ public class VkSectionMesher {
                         if (solid(data, neighbours, x + off[0], y + off[1], z + off[2])) {
                             continue;//hidden by its neighbour
                         }
-                        mask[v * SECTION_WIDTH + u] = Mapper.getBlockId(id) + 1;
+                        mask[v * SECTION_WIDTH + u] = mergeKey(id) + 1;
                     }
                 }
 
-                greedyEmit(quads, mask, face, axis, slice);
+                greedyEmit(quads, translucent, translucentStates, mask, face, axis, slice);
             }
         }
-        return quads;
+
+        if (translucent.isEmpty()) {
+            return new Mesh(quads.toLongArray(), quads.size());
+        }
+        int opaqueCount = quads.size();
+        quads.addAll(translucent);
+        return new Mesh(quads.toLongArray(), opaqueCount);
     }
 
     /** Merges the mask into as few rectangles as the packed format allows, then emits them. */
-    private static void greedyEmit(LongArrayList quads, int[] mask, int face, int axis, int slice) {
+    private static void greedyEmit(LongArrayList quads, LongArrayList translucent,
+                                   boolean[] translucentStates, long[] mask,
+                                   int face, int axis, int slice) {
         for (int v = 0; v < SECTION_WIDTH; v++) {
             for (int u = 0; u < SECTION_WIDTH; ) {
-                int value = mask[v * SECTION_WIDTH + u];
+                long value = mask[v * SECTION_WIDTH + u];
                 if (value == 0) {
                     u++;
                     continue;
@@ -151,7 +192,13 @@ public class VkSectionMesher {
                     x = u;
                     z = v;
                 }
-                quads.add(packQuad(face, width, height, x, y, z, value - 1));
+                long key = value - 1;
+                int stateId = (int) (key & 0xFFFFFL);
+                long packed = packQuad(face, width, height, x, y, z,
+                        stateId, (int) ((key >>> 20) & 0x1FF), (int) ((key >>> 29) & 0xFF));
+                boolean blended = translucentStates != null
+                        && stateId < translucentStates.length && translucentStates[stateId];
+                (blended ? translucent : quads).add(packed);
                 u += width;
             }
         }
