@@ -15,13 +15,13 @@ vanilla terrain, out to the configured render distance.
 Not yet ported: the model/texture atlas (terrain is drawn with Minecraft's map colours), hierarchical
 occlusion culling, background meshing and streaming, and SSAO.
 
-## Licence
+## License
 
 Voxy is **not** open source. `LICENSE.md` is MCRcortex's, in full:
 
 > Copyright 2025 MCRcortex. All rights reserved. Do not redistribute.
 
-That licence covers this repository too, and it grants no permission to fork, rebrand, redistribute
+That license covers this repository too, and it grants no permission to fork, rebrand, redistribute
 or publish. Nothing here is offered under any other terms.
 
 ## Building
