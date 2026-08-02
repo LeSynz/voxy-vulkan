@@ -75,19 +75,14 @@ public final class VkAtlasDownloader {
                     + " (" + (bytes >> 20) + " MiB)");
             device.createCommandEncoder().copyTextureToBuffer(texture, buffer, 0, () -> {
                 try (var view = buffer.map(true, false)) {
-                    var data = view.data().order(ByteOrder.nativeOrder());
                     var out = new int[w * h];
-                    //Read as bytes rather than as an IntBuffer: the texture is RGBA in memory order
-                    //and the rasteriser wants 0xAARRGGBB, which is not a straight reinterpretation
-                    //on a little endian machine.
-                    for (int i = 0; i < out.length; i++) {
-                        int base = i * 4;
-                        int r = data.get(base) & 0xFF;
-                        int g = data.get(base + 1) & 0xFF;
-                        int b = data.get(base + 2) & 0xFF;
-                        int a = data.get(base + 3) & 0xFF;
-                        out[i] = (a << 24) | (r << 16) | (g << 8) | b;
-                    }
+                    //Reinterpreted rather than reassembled byte by byte. The rasteriser is fed by
+                    //glGetTextureImage on the OpenGL path, which writes R,G,B,A into memory and
+                    //leaves Java to read that back as one int - so on a little endian machine it
+                    //sees 0xAABBGGRR. Building 0xAARRGGBB here instead swaps red and blue, which
+                    //shows up as blue foliage and purple water. Matching the memory layout exactly
+                    //is both simpler and the only way to be certain it agrees.
+                    view.data().order(ByteOrder.nativeOrder()).asIntBuffer().get(out);
                     pixels = out;
                     width = w;
                     height = h;

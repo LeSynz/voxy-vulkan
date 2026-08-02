@@ -46,7 +46,6 @@ layout(location = 0) out vec3 vColor;
 //How far across the quad this corner is, in blocks, so the texture repeats once per block of a
 //merged quad rather than being stretched across the whole run
 layout(location = 1) out vec2 vUv;
-layout(location = 2) out flat ivec2 vQuadSize;
 //Where this model's face sits in the atlas, and -1 in z when there is no baked model to sample
 layout(location = 3) out flat vec3 vAtlasBase;
 
@@ -144,16 +143,19 @@ void main() {
     bool tinted = tint.a >= 0.0;
 
     vUv = cornerUv * vec2(size);
-    vQuadSize = size;
 
     int modelId = stateId < uint(modelIds.length()) ? modelIds[stateId] : -1;
     if (modelId < 0) {
         vAtlasBase = vec3(0.0, 0.0, -1.0);
         vColor = (tinted ? tint.rgb : stateColour(stateId)) * lightFor(extractLightId(quad)) * shade;
     } else {
-        //A model owns one tile of a 256 by 256 grid; inside it the six faces sit in a 3 by 2 block
+        //A model owns one tile of a 256 by 256 grid; inside it the six faces sit in a 3 by 2 block.
+        //The mesher numbers faces by axis then direction - -X, +X, -Y, +Y, -Z, +Z - while the bakery
+        //lays its tiles out in Minecraft's Direction order: DOWN, UP, NORTH, SOUTH, WEST, EAST. The
+        //same six faces in a different order, which rotates by four.
+        uint atlasFace = (face + 4u) % 6u;
         vec2 modelUv = vec2(uint(modelId) & 0xFFu, (uint(modelId) >> 8) & 0xFFu) * (1.0 / 256.0);
-        vec2 faceUv = vec2(face >> 1u, face & 1u) * (1.0 / (vec2(3.0, 2.0) * 256.0));
+        vec2 faceUv = vec2(atlasFace >> 1u, atlasFace & 1u) * (1.0 / (vec2(3.0, 2.0) * 256.0));
         vAtlasBase = vec3(modelUv + faceUv, 1.0);
         vColor = (tinted ? tint.rgb : vec3(1.0)) * lightFor(extractLightId(quad)) * shade;
     }

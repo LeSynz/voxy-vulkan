@@ -9,7 +9,6 @@ layout(early_fragment_tests) in;
 
 layout(location = 0) in vec3 vColor;
 layout(location = 1) in vec2 vUv;
-layout(location = 2) in flat ivec2 vQuadSize;
 layout(location = 3) in flat vec3 vAtlasBase;
 
 layout(location = 0) out vec4 fragColor;
@@ -48,12 +47,7 @@ void main() {
     }
 
     //A merged quad spans several blocks, so the texture repeats once per block along it
-    vec2 tile = floor(vUv);
-    vec2 withinBlock = vUv - tile;
-    //The far edge of the quad lands exactly on the block after the last one, which would wrap round
-    //to the start of the texture. Voxy discards those; clamping keeps the edge pixel instead.
-    tile = clamp(tile, vec2(0.0), vec2(vQuadSize) - 1.0);
-
+    vec2 withinBlock = fract(vUv);
     vec2 texPos = vAtlasBase.xy + withinBlock * FACE_SCALE;
     //Derivatives taken from the atlas coordinate rather than the block coordinate, so mip selection
     //accounts for the repeat and distant terrain does not alias into noise
