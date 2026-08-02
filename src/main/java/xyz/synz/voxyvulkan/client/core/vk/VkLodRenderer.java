@@ -222,6 +222,12 @@ public class VkLodRenderer {
 
     /** How far the camera may drift from the last mesh centre before the rings are rebuilt. */
     private static final double REMESH_DISTANCE = 128.0;
+    /**
+     * How often a cold first mesh publishes what it has so far. Each publish copies the quads built
+     * to that point, so this trades a handful of extra uploads - only ever on a cold start, when
+     * there is nothing on screen to lose - for terrain appearing in about a second.
+     */
+    private static final int PROGRESSIVE_SECTION_INTERVAL = 400;
     /** Floor on how often newly ingested terrain alone may trigger a rebuild. */
     private static final long DIRTY_REMESH_INTERVAL_MS = 3_000;
     private long lastDirtyRemesh;
@@ -517,6 +523,16 @@ public class VkLodRenderer {
                                 1 << lvl));
                         sectionsMeshed++;
                         meshedThisLevel++;
+
+                        //Publishing only at level boundaries still meant six seconds of empty world,
+                        //because level 0 alone sweeps thousands of storage positions with no warm
+                        //cache. Emitting partway through it puts terrain up in about a second.
+                        if (progressive && sectionsMeshed % PROGRESSIVE_SECTION_INTERVAL == 0) {
+                            this.completedMesh.set(new MeshResult(allQuads.toLongArray(),
+                                    new ArrayList<>(builtDraws), maxQuadsPerSection, cameraX, cameraZ,
+                                    sectionsMeshed, (System.nanoTime() - start) / 1_000_000.0,
+                                    cacheHits, cacheMisses, edgeSections, invalidated, lvl));
+                        }
                     }
                 }
             }
