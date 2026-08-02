@@ -127,6 +127,6 @@ void main() {
 
     uint stateId = extractStateId(quad);
     vec4 tint = biomeTint(stateId, extractBiomeId(quad));
-    vec3 base = tint.a < 0.0 ? stateColour(stateId) : tint.rgb;
-    vColor = base * lightFor(extractLightId(quad)) * shade;
+    vec3 baseColour = tint.a < 0.0 ? stateColour(stateId) : tint.rgb;
+    vColor = baseColour * lightFor(extractLightId(quad)) * shade;
 }

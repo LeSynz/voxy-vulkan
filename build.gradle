@@ -424,3 +424,17 @@ if (!isInGHA) {
         }
     }
 }*/
+// Compiles the Vulkan GLSL straight from the source tree, so a syntax error is caught here rather
+// than at the first frame that builds a pipeline - which costs a whole launch and disables the
+// renderer for the session. Runs against the same shaderc the game uses.
+tasks.register('validateShaders', JavaExec) {
+    group = 'verification'
+    description = 'Compiles the Vulkan shaders with shaderc without launching Minecraft'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'xyz.synz.voxyvulkan.client.core.vk.VkShaderValidator'
+    args 'src/main/resources/assets/voxy/shaders'
+}
+
+// Part of `check`, so a broken shader fails the build instead of producing a jar that disables the
+// renderer on the first frame it tries to draw.
+tasks.named('check') { dependsOn 'validateShaders' }
