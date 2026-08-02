@@ -24,6 +24,10 @@ public class MixinFogRenderer {
             !System.getProperty("voxy.fogPatch", "true").equalsIgnoreCase("false");
     @Unique
     private static String voxy$lastLogged = "";
+    //Environmental fog interpolates, so 'log whenever it changes' means logging every frame for the
+    //length of a transition - dozens of lines that bury the [vk-lod] output actually being read
+    @Unique
+    private static long voxy$lastLogTime;
 
     @Inject(method = "setupFog", at = @At("RETURN"))
     private void voxy$modifyFog(Camera camera, int renderDistanceInChunks, DeltaTracker deltaTracker, float darkenWorldAmount, ClientLevel level, CallbackInfoReturnable<FogData> cir) {
@@ -66,8 +70,10 @@ public class MixinFogRenderer {
         String summary = "env " + (int) data.environmentalStart + "-" + (int) data.environmentalEnd
                 + " rd " + (int) data.renderDistanceStart + "-" + (int) data.renderDistanceEnd
                 + " skyEnd " + (int) data.skyEnd + " cloudEnd " + (int) data.cloudEnd;
-        if (!summary.equals(voxy$lastLogged)) {
+        long now = System.currentTimeMillis();
+        if (!summary.equals(voxy$lastLogged) && now - voxy$lastLogTime >= 1000) {
             voxy$lastLogged = summary;
+            voxy$lastLogTime = now;
             Logger.info("[vk-fog] y=" + (int) camera.position().y + " " + summary);
         }
     }

@@ -11,6 +11,8 @@ import java.nio.LongBuffer;
 import java.util.List;
 
 import static org.lwjgl.vulkan.KHRDynamicRendering.VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+import static org.lwjgl.vulkan.KHRPushDescriptor.VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+import static org.lwjgl.vulkan.KHRPushDescriptor.vkCmdPushDescriptorSetKHR;
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
@@ -102,8 +104,15 @@ public class VkGraphicsPipeline extends TrackedObject {
                             .descriptorCount(1)
                             .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
                 }
+                //Push descriptors: the bindings travel in the command buffer rather than living in
+                //a set we own. Voxy's geometry buffers are replaced wholesale whenever the world is
+                //remeshed, and rewriting a persistent set in place while earlier frames are still
+                //in flight reading it is a use after free. Pushing sidesteps the lifetime problem
+                //entirely - each recording carries its own bindings.
                 VkUtil.check(vkCreateDescriptorSetLayout(ctx.device,
-                        VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(bindings),
+                        VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default()
+                                .flags(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                                .pBindings(bindings),
                         null, handle), "vkCreateDescriptorSetLayout");
                 this.descriptorSetLayout = handle.get(0);
                 layoutInfo.pSetLayouts(stack.longs(this.descriptorSetLayout));
@@ -212,21 +221,13 @@ public class VkGraphicsPipeline extends TrackedObject {
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, data);
     }
 
-    private long cachedSet = VK_NULL_HANDLE;
-    private long[] cachedBuffers;
-
     /**
      * Binds storage buffers in the order the shader declares them.
      * <p>
-     * The descriptor set is allocated once and reused. Allocating per draw exhausts the pool within
-     * seconds, and descriptor sets are not implicitly freed. When the bound resources actually change
-     * the set is rewritten in place, which is safe here because bindings are stable across frames -
-     * the one exception being a window resize, which changes the bound image views while earlier
-     * frames may still be in flight. Minecraft idles the device to rebuild its swapchain, so that
-     * window is closed in practice rather than by anything done here.
-     * <p>
-     * Once geometry buffers start changing per frame this wants either per frame pool resets or
-     * VK_KHR_push_descriptor, which this device already has enabled.
+     * Bindings are pushed into the command buffer rather than written into a set we keep. An earlier
+     * version allocated one set and rewrote it whenever the bound resources changed, which was only
+     * ever safe while the geometry buffers never changed - the moment remeshing started replacing
+     * them, that rewrite was racing frames still in flight reading the old contents.
      */
     public void bindBuffers(VkCommandBuffer cmd, VkBuffer... buffers) {
         this.bindResources(cmd, buffers, null, null);
@@ -268,56 +269,16 @@ public class VkGraphicsPipeline extends TrackedObject {
         if (this.bindingCount == 0 && this.textureCount == 0) {
             return;
         }
-        var ctx = VkContext.get();
-
-        boolean unchanged = this.cachedSet != VK_NULL_HANDLE && this.cachedBuffers != null
-                && this.cachedBuffers.length == bufferLen + textureLen;
-        if (unchanged) {
-            for (int i = 0; i < bufferLen; i++) {
-                if (this.cachedBuffers[i] != buffers[i].buffer) {
-                    unchanged = false;
-                    break;
-                }
-            }
-            for (int i = 0; unchanged && i < textureLen; i++) {
-                if (this.cachedBuffers[bufferLen + i] != imageViews[i]) {
-                    unchanged = false;
-                }
-            }
-        }
-        if (unchanged) {
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, this.pipelineLayout, 0,
-                        stack.longs(this.cachedSet), null);
-            }
-            return;
-        }
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            if (this.cachedSet == VK_NULL_HANDLE) {
-                var setAlloc = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                        .descriptorPool(ctx.descriptorPool())
-                        .pSetLayouts(stack.longs(this.descriptorSetLayout));
-                LongBuffer setHandle = stack.mallocLong(1);
-                VkUtil.check(vkAllocateDescriptorSets(ctx.device, setAlloc, setHandle), "vkAllocateDescriptorSets");
-                this.cachedSet = setHandle.get(0);
-            }
-            long descriptorSet = this.cachedSet;
-
-            this.cachedBuffers = new long[bufferLen + textureLen];
-            for (int i = 0; i < bufferLen; i++) {
-                this.cachedBuffers[i] = buffers[i].buffer;
-            }
-            for (int i = 0; i < textureLen; i++) {
-                this.cachedBuffers[bufferLen + i] = imageViews[i];
-            }
-
             var writes = VkWriteDescriptorSet.calloc(bufferLen + textureLen, stack);
             for (int i = 0; i < bufferLen; i++) {
                 var bufferInfo = VkDescriptorBufferInfo.calloc(1, stack);
                 bufferInfo.get(0).buffer(buffers[i].buffer).offset(0).range(buffers[i].size());
                 writes.get(i).sType$Default()
-                        .dstSet(descriptorSet)
+                        //Left null: with push descriptors the set is supplied by the command, and
+                        //there is no set object of ours for the write to target
+                        .dstSet(VK_NULL_HANDLE)
                         .dstBinding(i)
                         .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                         .pBufferInfo(bufferInfo)
@@ -331,16 +292,13 @@ public class VkGraphicsPipeline extends TrackedObject {
                         .imageView(imageViews[i])
                         .imageLayout(imageLayout);
                 writes.get(bufferLen + i).sType$Default()
-                        .dstSet(descriptorSet)
+                        .dstSet(VK_NULL_HANDLE)
                         .dstBinding(bufferLen + i)
                         .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                         .pImageInfo(imageInfo)
                         .descriptorCount(1);
             }
-            vkUpdateDescriptorSets(ctx.device, writes, null);
-
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, this.pipelineLayout, 0,
-                    stack.longs(descriptorSet), null);
+            vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, this.pipelineLayout, 0, writes);
         }
     }
 
