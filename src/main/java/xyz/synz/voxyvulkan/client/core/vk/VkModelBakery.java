@@ -128,26 +128,38 @@ public class VkModelBakery {
             //and four megabytes is not worth a use after free to save.
             this.modelIdCapacity = mappings.length;
             this.modelIdBuffer = new VkBuffer((long) this.modelIdCapacity * Integer.BYTES, true);
+            //Filled once so that anything past the known states reads as 'no model' rather than as
+            //whatever the allocation happened to contain
+            long pointer = this.modelIdBuffer.mappedPointer();
+            for (int i = 0; i < this.modelIdCapacity; i++) {
+                MemoryUtil.memPutInt(pointer + (long) i * Integer.BYTES, -1);
+            }
+            this.modelIdBuffer.flush();
+        }
+
+        //Only the states that exist, and only when the count actually moved. Rewriting the whole
+        //million entry table every frame is four megabytes of pointless writes once baking is done.
+        int limit = Math.min(this.modelIdCapacity, Math.min(stateCount, mappings.length));
+        int baked = 0;
+        for (int state = 0; state < limit; state++) {
+            if (mappings[state] != -1) {
+                baked++;
+            }
+        }
+        if (baked == this.publishedModels) {
+            return;
         }
 
         long pointer = this.modelIdBuffer.mappedPointer();
-        int baked = 0;
-        int limit = Math.min(this.modelIdCapacity, mappings.length);
         for (int state = 0; state < limit; state++) {
-            int modelId = mappings[state];
-            if (modelId != -1) {
-                baked++;
-            }
-            MemoryUtil.memPutInt(pointer + (long) state * Integer.BYTES, modelId);
+            MemoryUtil.memPutInt(pointer + (long) state * Integer.BYTES, mappings[state]);
         }
         this.modelIdBuffer.flush();
 
-        if (baked != this.publishedModels) {
-            if (this.publishedModels == 0 || baked % 500 < (baked - this.publishedModels)) {
-                Logger.info("[vk-model] " + baked + " of " + stateCount + " block states baked");
-            }
-            this.publishedModels = baked;
+        if (this.publishedModels == 0 || baked / 1000 != this.publishedModels / 1000) {
+            Logger.info("[vk-model] " + baked + " of " + stateCount + " block states baked");
         }
+        this.publishedModels = baked;
     }
 
     public void shutdown() {

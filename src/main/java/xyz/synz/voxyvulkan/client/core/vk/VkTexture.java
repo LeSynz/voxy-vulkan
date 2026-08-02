@@ -226,26 +226,31 @@ public class VkTexture extends TrackedObject {
         if (regionCount == 0) {
             return;
         }
-        VkContext.get().submitBlocking(cmd -> {
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                var copies = VkBufferImageCopy.calloc(regionCount, stack);
-                for (int i = 0; i < regionCount; i++) {
-                    int base = i * 6;
-                    var copy = copies.get(i)
-                            .bufferOffset(Integer.toUnsignedLong(regions[base + 5]))
-                            .bufferRowLength(0)//tightly packed
-                            .bufferImageHeight(0);
-                    copy.imageSubresource()
-                            .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
-                            .mipLevel(regions[base])
-                            .baseArrayLayer(0)
-                            .layerCount(1);
-                    copy.imageOffset().set(regions[base + 1], regions[base + 2], 0);
-                    copy.imageExtent().set(regions[base + 3], regions[base + 4], 1);
-                }
-                vkCmdCopyBufferToImage(cmd, staging.buffer, this.image, layout, copies);
+        //Allocated off the memory stack rather than on it. A batch runs to a couple of thousand
+        //regions and each descriptor is 56 bytes, which comfortably exceeds LWJGL's 64 KiB stack -
+        //it does not grow, it throws. Freed as soon as the command is recorded, since recording
+        //copies the contents into the command buffer.
+        var copies = VkBufferImageCopy.calloc(regionCount);
+        try {
+            for (int i = 0; i < regionCount; i++) {
+                int base = i * 6;
+                var copy = copies.get(i)
+                        .bufferOffset(Integer.toUnsignedLong(regions[base + 5]))
+                        .bufferRowLength(0)//tightly packed
+                        .bufferImageHeight(0);
+                copy.imageSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(regions[base])
+                        .baseArrayLayer(0)
+                        .layerCount(1);
+                copy.imageOffset().set(regions[base + 1], regions[base + 2], 0);
+                copy.imageExtent().set(regions[base + 3], regions[base + 4], 1);
             }
-        });
+            VkContext.get().submitBlocking(cmd ->
+                    vkCmdCopyBufferToImage(cmd, staging.buffer, this.image, layout, copies));
+        } finally {
+            copies.free();
+        }
     }
 
     @Override
