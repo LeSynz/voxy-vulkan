@@ -1,0 +1,39 @@
+{
+  "required": true,
+  "package": "xyz.synz.voxyvulkan.client.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "client": [
+    "flashback.MixinFlashbackMeta",
+    "flashback.MixinFlashbackRecorder",
+    "minecraft.MixinClientChunkCache",
+    "minecraft.MixinClientLevel",
+    "minecraft.MixinDebugScreenEntryList",
+    "minecraft.MixinFogRenderer",
+    "minecraft.MixinLevelExtractor",
+    "minecraft.MixinLevelRenderer",
+    "minecraft.MixinRenderSystem",
+    "minecraft.MixinVulkanBackend",
+    "minecraft.MixinVulkanCommandEncoder",
+    "minecraft.session.MixinClientPacketListener",
+    "minecraft.session.MixinMinecraft",
+    "minecraft.util.MixinBlockableEventLoop",
+    "minecraft.util.MixinClientCommonPacketListenerImpl",
+    "minecraft.util.MixinGlDebug",
+    "minecraft.util.MixinGPUSelect",
+    "sodium.AccessorChunkTracker",
+    "sodium.AccessorSodiumWorldRenderer",
+    "sodium.MixinChunkJobQueue",
+    "sodium.MixinDefaultChunkRenderer",
+    "sodium.MixinFallbackVisibleChunkCollector",
+    "sodium.MixinRenderRegionManager",
+    "sodium.MixinRenderSectionManager",
+    "sodium.MixinSodiumWorldRenderer",
+    "sodium.MixinVisibleChunkCollector"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "overwrites": {
+    "requireAnnotations": true
+  }
+}
