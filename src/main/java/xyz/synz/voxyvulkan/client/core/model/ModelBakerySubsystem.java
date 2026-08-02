@@ -13,15 +13,26 @@ public class ModelBakerySubsystem {
     //Redo to just make it request the block faces with the async texture download stream which
     // basicly solves all the render stutter due to the baking
 
-    private final ModelStore storage = new ModelStore();
+    private final IModelSink storage;
     public final ModelFactory factory;
     private final Mapper mapper;
 
     private final Thread processingThread;
     private volatile boolean isRunning = true;
     private volatile Throwable processingThreadException;
+
     public ModelBakerySubsystem(Mapper mapper) {
+        this(mapper, new ModelStore());
+    }
+
+    /**
+     * @param storage where finished bakes go. The OpenGL renderer passes a {@link ModelStore}; the
+     *                Vulkan one passes its own, because {@code ModelStore}'s constructor allocates
+     *                OpenGL objects and there is no OpenGL context to allocate them in.
+     */
+    public ModelBakerySubsystem(Mapper mapper, IModelSink storage) {
         this.mapper = mapper;
+        this.storage = storage;
         this.factory = new ModelFactory(mapper, this.storage);
         this.processingThread = new Thread(()->{//TODO replace this with something good/integrate it into the async processor so that we just have less threads overall
             while (this.isRunning) {
@@ -56,7 +67,9 @@ public class ModelBakerySubsystem {
         }
 
         this.factory.free();
-        this.storage.free();
+        if (this.storage instanceof ModelStore store) {
+            store.free();
+        }
     }
 
     //This is on this side only and done like this as only worker threads call this code
@@ -90,6 +103,10 @@ public class ModelBakerySubsystem {
     }
 
     public ModelStore getStore() {
+        return (ModelStore) this.storage;
+    }
+
+    public IModelSink getSink() {
         return this.storage;
     }
 

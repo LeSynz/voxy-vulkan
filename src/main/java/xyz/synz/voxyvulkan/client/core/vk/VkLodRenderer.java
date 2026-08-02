@@ -96,6 +96,14 @@ public class VkLodRenderer {
     private VkSampler lightSampler;
     private VkTexture fallbackLightmap;
     private VkBlockTints.Tables tints;
+
+    //The baked block model atlas. Terrain draws with flat colours until this is ready and simply
+    //starts using textures once it is, so a slow or failed bake costs detail rather than terrain.
+    private VkModelStore modelStore;
+    private VkModelBakery modelBakery;
+    private VkBuffer fallbackModelIds;
+    private VkTexture fallbackAtlas;
+    private boolean bakeryStartRequested;
     private boolean triedTints;
     private boolean failed;
     private boolean loggedDraw;
@@ -861,6 +869,8 @@ public class VkLodRenderer {
      * thread is a freeze. So it runs on a worker and the result is swapped in when it arrives.
      */
     private void tickMeshing(double cameraX, double cameraY, double cameraZ) {
+        this.tickModelBakery();
+
         var finished = this.completedMesh.getAndSet(null);
         if (finished != null) {
             this.uploadMesh(finished);
@@ -911,6 +921,46 @@ public class VkLodRenderer {
                 this.meshInFlight = false;
             }
         });
+    }
+
+    /**
+     * Starts the model bakery once, then pumps its finished bakes to the GPU. Render thread only.
+     * <p>
+     * The bakery is constructed on a worker rather than here, because the first thing it does is
+     * block waiting for Minecraft's block atlas, and that only arrives if this thread stays free.
+     */
+    private void tickModelBakery() {
+        if (!this.bakeryStartRequested) {
+            this.bakeryStartRequested = true;
+            try {
+                this.modelStore = new VkModelStore();
+                this.modelBakery = new VkModelBakery(this.world.getMapper(), this.modelStore);
+                var starter = new Thread(this.modelBakery::startBlocking, "voxy-vk-bakery-start");
+                starter.setDaemon(true);
+                starter.start();
+            } catch (Throwable t) {
+                Logger.error("[vk-model] could not create the model store, staying on map colours", t);
+                this.modelStore = null;
+                this.modelBakery = null;
+            }
+        }
+        if (this.modelBakery != null && this.modelBakery.isReady()) {
+            this.modelBakery.tick();
+            if (!this.loggedTextured && this.modelBakery.publishedModels() > 0) {
+                this.loggedTextured = true;
+                Logger.info("[vk-model] textured LOD rendering active, first "
+                        + this.modelBakery.publishedModels() + " models baked");
+            }
+        }
+    }
+
+    private boolean loggedTextured;
+
+    /** True once there are baked models to sample instead of flat colours. */
+    private boolean modelsUsable() {
+        return this.modelBakery != null && this.modelBakery.isReady()
+                && !this.modelBakery.hasFailed() && this.modelBakery.modelIdBuffer() != null
+                && this.modelStore != null;
     }
 
     /** Queues a buffer for release once no frame recorded against it can still be in flight. */
@@ -1060,7 +1110,16 @@ public class VkLodRenderer {
      * depth comparison the two scales can no longer support.
      */
     public void onRenderPassEnded() {
-        if (this.failed || !this.drawQueued) {
+        if (this.failed) {
+            return;
+        }
+        //Ahead of the drawQueued check on purpose. This is the only place we are certain no render
+        //pass is open, which a buffer copy requires, and it has to happen even on the early frames
+        //where there is no mesh to draw yet - otherwise the bakery waits for an atlas that was
+        //never asked for. Never waited for on this thread: the copy only completes because this
+        //thread keeps drawing. See VkAtlasDownloader.
+        VkAtlasDownloader.start();
+        if (!this.drawQueued) {
             return;
         }
         this.drawQueued = false;
@@ -1102,6 +1161,15 @@ public class VkLodRenderer {
             }
             this.passLightmapView = lightmapView;
 
+            //Stand ins for the model bindings, so the draw is identical whether or not the bakery
+            //has finished. A single -1 reads as 'no baked model' for every state the shader asks about.
+            if (this.fallbackModelIds == null) {
+                this.fallbackModelIds = new VkBuffer(Integer.BYTES, true);
+                MemoryUtil.memPutInt(this.fallbackModelIds.mappedPointer(), -1);
+                this.fallbackModelIds.flush();
+                this.fallbackAtlas = VkTexture.singlePixel(0xFFFFFFFF);
+            }
+
             long key = ((long) this.passColorFormat << 32) | (this.passDepthFormat & 0xFFFFFFFFL);
             var pipeline = this.pipelines.get(key);
             if (pipeline == null) {
@@ -1111,17 +1179,19 @@ public class VkLodRenderer {
                 //our own target's, not the pass's, since that is what the pipeline renders against.
                 //Four storage buffers (quads, block colours, tint offsets, tint colours) then two
                 //samplers (Minecraft's depth, Minecraft's lightmap)
+                //Five storage buffers (quads, block colours, tint offsets, tint colours, model ids)
+                //then three samplers (Minecraft's depth, Minecraft's lightmap, the model atlas)
                 pipeline = new VkGraphicsPipeline(
                         "voxy:vk/lod_quads.vert", "voxy:vk/lod_quads.frag",
                         this.passColorFormat, VK_FORMAT_D32_SFLOAT,
-                        true, true, compareOp, PUSH_CONSTANT_SIZE, 4, 2, VK_CULL_MODE_NONE);
+                        true, true, compareOp, PUSH_CONSTANT_SIZE, 5, 3, VK_CULL_MODE_NONE);
                 this.pipelines.put(key, pipeline);
                 //Same shaders, blended, and writing no depth - translucent surfaces must not hide
                 //the translucent surfaces behind them, only be hidden by opaque ones in front
                 this.translucentPipelines.put(key, new VkGraphicsPipeline(
                         "voxy:vk/lod_quads.vert", "voxy:vk/lod_quads.frag",
                         this.passColorFormat, VK_FORMAT_D32_SFLOAT,
-                        true, false, compareOp, PUSH_CONSTANT_SIZE, 4, 2, VK_CULL_MODE_NONE, true));
+                        true, false, compareOp, PUSH_CONSTANT_SIZE, 5, 3, VK_CULL_MODE_NONE, true));
                 Logger.info("[vk-lod] built LOD pipelines, colour format " + this.passColorFormat
                         + ", own depth target " + width + "x" + height);
             }
@@ -1173,11 +1243,18 @@ public class VkLodRenderer {
     private void recordDraws(VkCommandBuffer cmd, VkGraphicsPipeline pipeline, MemoryStack stack,
                              int width, int height, boolean translucentPass) {
         pipeline.bind(cmd, width, height);
+        //Until the bakery has produced anything there is still a binding to fill, so a table of all
+        //-1 and a one pixel atlas stand in. The shader reads -1 as 'no model, use the flat colour',
+        //so the fallbacks are what make textured and untextured the same code path.
+        boolean textured = this.modelsUsable();
         pipeline.bindResources(cmd,
                 new VkBuffer[]{this.quadBuffer, this.colourBuffer,
-                        this.tints.stateOffsets(), this.tints.colours()},
-                new long[]{this.passDepthView, this.passLightmapView},
-                new VkSampler[]{this.depthSampler, this.lightSampler},
+                        this.tints.stateOffsets(), this.tints.colours(),
+                        textured ? this.modelBakery.modelIdBuffer() : this.fallbackModelIds},
+                new long[]{this.passDepthView, this.passLightmapView,
+                        textured ? this.modelStore.atlas.imageView : this.fallbackAtlas.imageView},
+                new VkSampler[]{this.depthSampler, this.lightSampler,
+                        textured ? this.modelStore.sampler : this.lightSampler},
                 VK_IMAGE_LAYOUT_GENERAL);
         vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
@@ -1258,6 +1335,10 @@ public class VkLodRenderer {
         debug.add(String.format("Voxy-VK cache: %d sections, %dk quads, %d absent, %d dirty",
                 this.meshCache.size(), this.cachedQuads / 1000,
                 this.absentSections.size(), this.dirtySections.size()));
+        debug.add("Voxy-VK models: " + (this.modelBakery == null ? "not started"
+                : this.modelBakery.hasFailed() ? "failed, using map colours"
+                : !this.modelBakery.isReady() ? "baking..."
+                : this.modelBakery.publishedModels() + " baked"));
     }
 
     private int lastQuadCount;
@@ -1362,6 +1443,22 @@ public class VkLodRenderer {
             if (this.fallbackLightmap != null) {
                 this.fallbackLightmap.free();
                 this.fallbackLightmap = null;
+            }
+            if (this.fallbackModelIds != null) {
+                this.fallbackModelIds.free();
+                this.fallbackModelIds = null;
+            }
+            if (this.fallbackAtlas != null) {
+                this.fallbackAtlas.free();
+                this.fallbackAtlas = null;
+            }
+            if (this.modelBakery != null) {
+                this.modelBakery.shutdown();
+                this.modelBakery = null;
+            }
+            if (this.modelStore != null) {
+                this.modelStore.free();
+                this.modelStore = null;
             }
             if (this.tints != null) {
                 this.tints.free();

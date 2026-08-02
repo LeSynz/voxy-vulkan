@@ -57,6 +57,23 @@ public class SoftwareModelTextureBakery {
     }
 
     public void setupTexture() {
+        //On Vulkan there is no glGetTextureImage, and blaze3d's replacement is asynchronous, so the
+        //pixels are fetched separately and simply waited for here. This method already runs on the
+        //bakery's own thread, which is what makes blocking safe - see VkAtlasDownloader.
+        if (!xyz.synz.voxyvulkan.client.core.vk.VkInterop.isVulkanBackend()) {
+            this.setupTextureGl();
+            return;
+        }
+        if (!xyz.synz.voxyvulkan.client.core.vk.VkAtlasDownloader.await(60)) {
+            throw new IllegalStateException("Block atlas was never delivered, cannot bake models");
+        }
+        this.rasterizer.setSamplerTexture(
+                xyz.synz.voxyvulkan.client.core.vk.VkAtlasDownloader.pixels(),
+                xyz.synz.voxyvulkan.client.core.vk.VkAtlasDownloader.width(),
+                xyz.synz.voxyvulkan.client.core.vk.VkAtlasDownloader.height());
+    }
+
+    private void setupTextureGl() {
         var tex = Minecraft.getInstance().getTextureManager().getTexture(Identifier.fromNamespaceAndPath("minecraft", "textures/atlas/blocks.png")).getTexture();
         if (tex.getFormat() != GpuFormat.RGBA8_UNORM) {
             throw new IllegalStateException("Block atlas not rgba8: " + tex.getFormat());

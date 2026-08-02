@@ -26,8 +26,13 @@ layout(std430, binding = 3) restrict readonly buffer TintColourBuffer {
     uint tintColours[];
 };
 
+//Block id to baked model id, or -1 where the model has not been baked yet
+layout(std430, binding = 4) restrict readonly buffer ModelIdBuffer {
+    int modelIds[];
+};
+
 //Minecraft's own lightmap, so block and sky light read the same as they do up close
-layout(binding = 5) uniform sampler2D lightmap;
+layout(binding = 6) uniform sampler2D lightmap;
 
 //Must stay byte for byte identical to the block in lod_quads.frag - one push constant range is
 //shared by both stages, so a mismatch silently misreads whichever stage disagrees
@@ -38,6 +43,12 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 layout(location = 0) out vec3 vColor;
+//How far across the quad this corner is, in blocks, so the texture repeats once per block of a
+//merged quad rather than being stretched across the whole run
+layout(location = 1) out vec2 vUv;
+layout(location = 2) out flat ivec2 vQuadSize;
+//Where this model's face sits in the atlas, and -1 in z when there is no baked model to sample
+layout(location = 3) out flat vec3 vAtlasBase;
 
 //A face is axis*2 + direction, so the quad lies in the plane of the two axes that are not `axis`
 vec3 planeOffset(uint axis, vec2 uv) {
@@ -127,6 +138,23 @@ void main() {
 
     uint stateId = extractStateId(quad);
     vec4 tint = biomeTint(stateId, extractBiomeId(quad));
-    vec3 baseColour = tint.a < 0.0 ? stateColour(stateId) : tint.rgb;
-    vColor = baseColour * lightFor(extractLightId(quad)) * shade;
+    //With a real texture the tint multiplies it, the way Minecraft tints a greyscale sprite. With
+    //only a map colour to fall back on the tint replaces it, because that colour already has the
+    //tint baked in and applying it twice comes out muddy.
+    bool tinted = tint.a >= 0.0;
+
+    vUv = cornerUv * vec2(size);
+    vQuadSize = size;
+
+    int modelId = stateId < uint(modelIds.length()) ? modelIds[stateId] : -1;
+    if (modelId < 0) {
+        vAtlasBase = vec3(0.0, 0.0, -1.0);
+        vColor = (tinted ? tint.rgb : stateColour(stateId)) * lightFor(extractLightId(quad)) * shade;
+    } else {
+        //A model owns one tile of a 256 by 256 grid; inside it the six faces sit in a 3 by 2 block
+        vec2 modelUv = vec2(uint(modelId) & 0xFFu, (uint(modelId) >> 8) & 0xFFu) * (1.0 / 256.0);
+        vec2 faceUv = vec2(face >> 1u, face & 1u) * (1.0 / (vec2(3.0, 2.0) * 256.0));
+        vAtlasBase = vec3(modelUv + faceUv, 1.0);
+        vColor = (tinted ? tint.rgb : vec3(1.0)) * lightFor(extractLightId(quad)) * shade;
+    }
 }

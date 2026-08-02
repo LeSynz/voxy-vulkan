@@ -192,6 +192,8 @@ public class VkTexture extends TrackedObject {
         return switch (layout) {
             case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL -> VK_ACCESS_TRANSFER_WRITE_BIT;
             case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL -> VK_ACCESS_SHADER_READ_BIT;
+            //GENERAL is what images shared with Minecraft sit in, and they can be read by anything
+            case VK_IMAGE_LAYOUT_GENERAL -> VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             default -> 0;
         };
     }
@@ -200,8 +202,50 @@ public class VkTexture extends TrackedObject {
         return switch (layout) {
             case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL -> VK_PIPELINE_STAGE_TRANSFER_BIT;
             case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL -> VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            case VK_IMAGE_LAYOUT_GENERAL -> VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
             default -> VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         };
+    }
+
+    /**
+     * Copies many staged regions into the image in one submission.
+     * <p>
+     * The per region {@link #uploadSubImage} allocates a staging buffer, submits and waits every
+     * time, which is fine for the odd upload and ruinous for a model atlas - seven thousand models
+     * of six faces and four mips would be tens of thousands of round trips to the GPU.
+     *
+     * Copies into the image's current layout rather than moving it to {@code TRANSFER_DST} and back.
+     * A layout transition applies to the whole image, so doing one here would be changing the layout
+     * of a texture that frames already in flight are sampling. Copying straight into
+     * {@code GENERAL} is legal, and writing a region no draw refers to yet is safe.
+     *
+     * @param regions flattened as {mipLevel, x, y, width, height, byteOffsetIntoStaging} per region
+     * @param layout the image's current layout, which the copy targets directly
+     */
+    public void uploadRegions(VkBuffer staging, int[] regions, int regionCount, int layout) {
+        if (regionCount == 0) {
+            return;
+        }
+        VkContext.get().submitBlocking(cmd -> {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                var copies = VkBufferImageCopy.calloc(regionCount, stack);
+                for (int i = 0; i < regionCount; i++) {
+                    int base = i * 6;
+                    var copy = copies.get(i)
+                            .bufferOffset(Integer.toUnsignedLong(regions[base + 5]))
+                            .bufferRowLength(0)//tightly packed
+                            .bufferImageHeight(0);
+                    copy.imageSubresource()
+                            .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                            .mipLevel(regions[base])
+                            .baseArrayLayer(0)
+                            .layerCount(1);
+                    copy.imageOffset().set(regions[base + 1], regions[base + 2], 0);
+                    copy.imageExtent().set(regions[base + 3], regions[base + 4], 1);
+                }
+                vkCmdCopyBufferToImage(cmd, staging.buffer, this.image, layout, copies);
+            }
+        });
     }
 
     @Override
