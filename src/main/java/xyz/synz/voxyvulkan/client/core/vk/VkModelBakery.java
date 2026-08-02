@@ -94,10 +94,20 @@ public class VkModelBakery {
             this.bakery.tick(0);
             this.refreshModelIds();
         } catch (Throwable t) {
-            this.failed = true;
-            Logger.error("[vk-model] model bakery failed while uploading, staying on map colours", t);
+            //One bad model should not cost every other model its texture, so a few failures are
+            //tolerated before the whole atlas is given up on
+            this.uploadFailures++;
+            Logger.error("[vk-model] model upload failed (" + this.uploadFailures + " of "
+                    + MAX_UPLOAD_FAILURES + " tolerated)", t);
+            if (this.uploadFailures >= MAX_UPLOAD_FAILURES) {
+                this.failed = true;
+                Logger.error("[vk-model] too many upload failures, staying on map colours");
+            }
         }
     }
+
+    private int uploadFailures;
+    private static final int MAX_UPLOAD_FAILURES = 8;
 
     /**
      * Copies the factory's block-to-model table into a storage buffer.

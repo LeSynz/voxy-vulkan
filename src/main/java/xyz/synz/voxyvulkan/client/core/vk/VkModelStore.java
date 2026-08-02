@@ -87,17 +87,26 @@ public class VkModelStore implements IModelSink {
      * trips, each one stalling until the GPU catches up, which is far slower than the baking itself.
      */
     private static final int STAGED_MODELS = 512;
-    private static final int MODEL_TEXTURE_BYTES =
-            2 * 3 * computeSizeWithMips(ModelFactory.MODEL_TEXTURE_SIZE) * 4;
+    private static final int MAX_REGIONS = STAGED_MODELS * ModelFactory.LAYERS;
+    /**
+     * Bytes one model actually contributes: the mip levels that are uploaded, and no more.
+     * <p>
+     * Derived from the same loop that writes them rather than from the bakery's buffer size. The
+     * bakery sizes its buffer with every mip down to a single pixel, but only {@code LAYERS} of them
+     * are ever uploaded - so using that figure here over-estimates each model, lets one more through
+     * than the region array has room for, and overruns it by exactly one model's worth.
+     */
+    private static final int MODEL_STAGED_BYTES = computeStagedBytes();
     private VkBuffer staging;
-    private final int[] pendingRegions = new int[STAGED_MODELS * ModelFactory.LAYERS * 6];
+    private final int[] pendingRegions = new int[MAX_REGIONS * 6];
     private int pendingRegionCount;
     private int stagedBytes;
 
-    private static int computeSizeWithMips(int size) {
+    private static int computeStagedBytes() {
         int total = 0;
-        for (int level = size; level >= 1; level >>= 1) {
-            total += level * level;
+        for (int lvl = 0; lvl < ModelFactory.LAYERS; lvl++) {
+            total += ((ModelFactory.MODEL_TEXTURE_SIZE * 3) >> lvl)
+                    * ((ModelFactory.MODEL_TEXTURE_SIZE * 2) >> lvl) * 4;
         }
         return total;
     }
@@ -108,11 +117,14 @@ public class VkModelStore implements IModelSink {
             return;
         }
         if (this.staging == null) {
-            this.staging = new VkBuffer((long) STAGED_MODELS * MODEL_TEXTURE_BYTES,
+            this.staging = new VkBuffer((long) STAGED_MODELS * MODEL_STAGED_BYTES,
                     org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
         }
-        //Flush early if this model would not fit, so the staging buffer is a fixed size
-        if (this.stagedBytes + MODEL_TEXTURE_BYTES > this.staging.size()) {
+        //Flushed early if this model would not fit, so the staging buffer stays a fixed size. Both
+        //limits are checked: bytes and region slots run out together only if the two constants agree
+        //exactly, and relying on that is what overran the array the first time.
+        if (this.pendingRegionCount + ModelFactory.LAYERS > MAX_REGIONS
+                || this.stagedBytes + MODEL_STAGED_BYTES > this.staging.size()) {
             this.flushTextureBatch();
         }
 
