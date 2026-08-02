@@ -1,14 +1,19 @@
 #version 460 core
 
-//A discard anywhere in the shader would otherwise disable early depth testing for the whole
-//pipeline, and every hidden LOD quad behind a nearer one would run this shader. Forcing early tests
-//costs us the usual guarantee - a discarded fragment has already written depth - but that is exactly
-//harmless here: the only fragments discarded are ones vanilla terrain already covers, where nothing
-//of ours should be visible at any depth anyway.
-layout(early_fragment_tests) in;
+//Early fragment tests are deliberately NOT forced here.
+//
+//They were, back when the only discard was the vanilla coverage test - writing depth for a fragment
+//that is then discarded is harmless when the pixel belongs to vanilla anyway. The alpha cutout broke
+//that reasoning: the gaps in grass, flowers and leaves discard too, and with early tests those gaps
+//write depth and punch holes through everything behind them. Sky through the middle of a meadow.
+//
+//The cost is losing early Z on hidden LOD geometry. Recovering it means splitting cutout blocks into
+//their own pass, the way vanilla separates SOLID from CUTOUT, so that the pass without a cutout can
+//still force early tests.
 
 layout(location = 0) in vec3 vColor;
 layout(location = 1) in vec2 vUv;
+layout(location = 2) in flat vec4 vTint;
 layout(location = 3) in flat vec3 vAtlasBase;
 
 layout(location = 0) out vec4 fragColor;
@@ -45,6 +50,7 @@ void main() {
         fragColor = vec4(vColor, pc.depthParams.z);
         return;
     }
+    //From here vColor is just light times face shading; the texture supplies the colour.
 
     //A merged quad spans several blocks, so the texture repeats once per block along it
     vec2 withinBlock = fract(vUv);
@@ -60,5 +66,16 @@ void main() {
         discard;
     }
 
-    fragColor = vec4(sampled.rgb * vColor, pc.depthParams.z);
+    vec3 rgb = sampled.rgb;
+    if (vTint.a >= 0.0) {
+        //Only pixels that are already grey take the biome colour. Minecraft tints a greyscale
+        //sprite, so a block whose texture is partly coloured - a grass block's side, which is dirt
+        //below and grass fringe above - must not have the whole thing turned green. Voxy makes the
+        //same test; doing it per pixel avoids needing the model's tinting flags bound as well.
+        if (abs(rgb.r - rgb.g) < 0.02 && abs(rgb.g - rgb.b) < 0.02) {
+            rgb *= vTint.rgb;
+        }
+    }
+
+    fragColor = vec4(rgb * vColor, pc.depthParams.z);
 }

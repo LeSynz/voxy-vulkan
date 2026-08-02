@@ -42,10 +42,15 @@ layout(push_constant) uniform PushConstants {
     vec4 depthParams;//x = the depth value meaning 'Minecraft drew nothing'; y = biome count
 } pc;
 
+//Untextured this is the finished colour; textured it is only light times face shading, and the
+//texture supplies the rest
 layout(location = 0) out vec3 vColor;
 //How far across the quad this corner is, in blocks, so the texture repeats once per block of a
 //merged quad rather than being stretched across the whole run
 layout(location = 1) out vec2 vUv;
+//The biome colour for this block, with a below zero alpha meaning it is not a tinted block. Applied
+//in the fragment stage because whether a given pixel takes it depends on the pixel.
+layout(location = 2) out flat vec4 vTint;
 //Where this model's face sits in the atlas, and -1 in z when there is no baked model to sample
 layout(location = 3) out flat vec3 vAtlasBase;
 
@@ -137,15 +142,15 @@ void main() {
 
     uint stateId = extractStateId(quad);
     vec4 tint = biomeTint(stateId, extractBiomeId(quad));
-    //With a real texture the tint multiplies it, the way Minecraft tints a greyscale sprite. With
-    //only a map colour to fall back on the tint replaces it, because that colour already has the
-    //tint baked in and applying it twice comes out muddy.
     bool tinted = tint.a >= 0.0;
+    vTint = tint;
 
     vUv = cornerUv * vec2(size);
 
     int modelId = stateId < uint(modelIds.length()) ? modelIds[stateId] : -1;
     if (modelId < 0) {
+        //Falling back to the block's map colour, where the tint replaces it rather than multiplying
+        //it - a map colour already has the tint baked in, so applying it twice comes out muddy.
         vAtlasBase = vec3(0.0, 0.0, -1.0);
         vColor = (tinted ? tint.rgb : stateColour(stateId)) * lightFor(extractLightId(quad)) * shade;
     } else {
@@ -157,6 +162,7 @@ void main() {
         vec2 modelUv = vec2(uint(modelId) & 0xFFu, (uint(modelId) >> 8) & 0xFFu) * (1.0 / 256.0);
         vec2 faceUv = vec2(atlasFace >> 1u, atlasFace & 1u) * (1.0 / (vec2(3.0, 2.0) * 256.0));
         vAtlasBase = vec3(modelUv + faceUv, 1.0);
-        vColor = (tinted ? tint.rgb : vec3(1.0)) * lightFor(extractLightId(quad)) * shade;
+        //The tint is not folded in here - the fragment stage decides per pixel whether to apply it
+        vColor = lightFor(extractLightId(quad)) * shade;
     }
 }
